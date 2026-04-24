@@ -46,7 +46,7 @@ featured_image_class = "cover bg-top"
 cover_dimming_class = "bg-black-60"
 recent_posts_number = 3
 
-# see https://github.com/theNewDynamic/gohugo-theme-ananke/wiki/Customization-Comments
+# see https://github.com/gohugo-ananke/ananke/wiki/Customization-Comments
 commentoEnable = true
 # commentoPath = "https://cdn.commento.io/js/commento.js" # your selfhosted commento instance URL
 
