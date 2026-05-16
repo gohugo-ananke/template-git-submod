@@ -18,5 +18,8 @@
   "bugs": {
     "url": "https://github.com/gohugo-ananke/template-git-submod/issues"
   },
-  "homepage": "https://github.com/gohugo-ananke/template-git-submod#readme"
+  "homepage": "https://github.com/gohugo-ananke/template-git-submod#readme",
+  "devDependencies": {
+    "cspell": "10.0.0"
+  }
 }
