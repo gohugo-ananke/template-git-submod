@@ -1,3 +1,4 @@
 [submodule "themes/ananke"]
 	path = themes/ananke
 	url = https://github.com/gohugo-ananke/ananke.git
+	branch = main

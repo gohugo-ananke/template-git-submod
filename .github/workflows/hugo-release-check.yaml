@@ -1,5 +1,12 @@
 name: Hugo latest build watch
 
+# This workflow monitors the latest Hugo release and runs a build with it to
+# detect potential compatibility issues early. It is triggered on a schedule and
+# can also be triggered manually.
+#
+# This workflow is Git-submodule specific. It updates the configured Ananke
+# submodule to the latest commit on the configured branch before running Hugo.
+
 on:
   workflow_dispatch:
   schedule:
@@ -10,26 +17,32 @@ permissions:
   contents: read
 
 concurrency:
-  group: hugo-latest-build-watch
+  group: hugo-latest-build-watch-submodule
   cancel-in-progress: false
 
 env:
   TARGET_ISSUE_REPOSITORY: gohugo-ananke/ananke
   ISSUE_LABELS: status:blocked,prio:critical
+  ISSUE_ASSIGNEES: davidsneighbour
+
   HUGO_EXTENDED: "false"
   HUGO_BUILD_COMMAND: hugo --printI18nWarnings --printPathWarnings --printUnusedTemplates
 
+  ANANKE_SUBMODULE_PATH: themes/ananke
+  ANANKE_EXPECTED_BRANCH: main
+
 jobs:
   check-latest-hugo:
-    name: Check latest Hugo build
+    name: Check latest Hugo build with Git submodule
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
+          submodules: recursive
 
       - name: Detect latest Hugo release
         id: hugo
@@ -49,6 +62,7 @@ jobs:
           fi
 
           arch="linux-amd64"
+
           if [[ "${HUGO_EXTENDED}" == "true" ]]; then
             asset_pattern="hugo_extended_${version#v}_${arch}.tar.gz"
           else
@@ -68,20 +82,24 @@ jobs:
             exit 1
           fi
 
+          release_url="https://github.com/gohugoio/hugo/releases/tag/${version}"
+
           {
             echo "version=${version}"
             echo "asset_url=${asset_url}"
-            echo "cache_key=hugo-build-tested-${version}"
+            echo "release_url=${release_url}"
+            echo "cache_key=hugo-build-tested-submodule-${version}"
           } >> "${GITHUB_OUTPUT}"
 
           echo "Latest Hugo release: ${version}"
           echo "Asset: ${asset_url}"
+          echo "Release notes: ${release_url}"
 
       - name: Check whether this Hugo version was already tested
         id: tested-cache
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
-          path: .github/.cache/hugo-latest-build-watch
+          path: .github/.cache/hugo-latest-build-watch-submodule
           key: ${{ steps.hugo.outputs.cache_key }}
           lookup-only: true
 
@@ -89,7 +107,19 @@ jobs:
         if: steps.tested-cache.outputs.cache-hit == 'true' && github.event_name != 'workflow_dispatch'
         shell: bash
         run: |
-          echo "Hugo ${{ steps.hugo.outputs.version }} was already tested. Nothing to do."
+          echo "Hugo ${{ steps.hugo.outputs.version }} was already tested successfully for the Git submodule build. Nothing to do."
+
+      - name: Configure runtime cache paths
+        if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          {
+            echo "HUGO_CACHEDIR=${RUNNER_TEMP}/hugo-cache"
+            echo "GOPATH=${RUNNER_TEMP}/go"
+            echo "GOMODCACHE=${RUNNER_TEMP}/go/pkg/mod"
+          } >> "${GITHUB_ENV}"
 
       - name: Prepare Hugo
         if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
@@ -98,6 +128,7 @@ jobs:
           set -Eeuo pipefail
 
           mkdir -p "${RUNNER_TEMP}/hugo"
+
           curl --fail --location --silent --show-error \
             --output "${RUNNER_TEMP}/hugo/hugo.tar.gz" \
             "${{ steps.hugo.outputs.asset_url }}"
@@ -109,7 +140,117 @@ jobs:
             echo "${RUNNER_TEMP}/hugo"
           } >> "${GITHUB_PATH}"
 
-          "${RUNNER_TEMP}/hugo/hugo" version
+      - name: Verify Hugo executable
+        if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if ! command -v hugo > /dev/null 2>&1; then
+            echo "::error::Hugo executable was not found on PATH."
+            exit 1
+          fi
+
+          hugo version
+
+      - name: Update Ananke Git submodule
+        id: ananke
+        if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          ANANKE_SUBMODULE_PATH: ${{ env.ANANKE_SUBMODULE_PATH }}
+          ANANKE_EXPECTED_BRANCH: ${{ env.ANANKE_EXPECTED_BRANCH }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! -f ".gitmodules" ]]; then
+            echo "::error::No .gitmodules file found. This workflow is for the Git submodule implementation."
+            exit 1
+          fi
+
+          if [[ -z "${ANANKE_SUBMODULE_PATH}" ]]; then
+            echo "::error::ANANKE_SUBMODULE_PATH is empty."
+            exit 1
+          fi
+
+          submodule_name="$(
+            git config -f .gitmodules --get-regexp '^submodule\..*\.path$' \
+              | awk -v path="${ANANKE_SUBMODULE_PATH}" '
+                  $2 == path {
+                    key = $1
+                    sub(/^submodule\./, "", key)
+                    sub(/\.path$/, "", key)
+                    print key
+                    exit
+                  }
+                '
+          )"
+
+          if [[ -z "${submodule_name}" ]]; then
+            echo "::error::No submodule entry in .gitmodules points to ${ANANKE_SUBMODULE_PATH}."
+            exit 1
+          fi
+
+          configured_branch="$(
+            git config -f .gitmodules --get "submodule.${submodule_name}.branch" || true
+          )"
+
+          branch_warning=""
+
+          if [[ -n "${ANANKE_EXPECTED_BRANCH}" && "${configured_branch}" != "${ANANKE_EXPECTED_BRANCH}" ]]; then
+            branch_warning="Expected .gitmodules branch for ${ANANKE_SUBMODULE_PATH} to be '${ANANKE_EXPECTED_BRANCH}', but found '${configured_branch:-<unset>}'. git submodule update --remote may not test the intended branch."
+            echo "::warning file=.gitmodules::${branch_warning}"
+          fi
+
+          {
+            echo "ananke_submodule_name=${submodule_name}"
+            echo "ananke_configured_branch=${configured_branch}"
+            echo "ananke_branch_warning<<EOF"
+            printf '%s\n' "${branch_warning}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Synchronising configured Git submodules."
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+          if [[ ! -d "${ANANKE_SUBMODULE_PATH}" ]]; then
+            echo "::error::Ananke submodule path does not exist: ${ANANKE_SUBMODULE_PATH}"
+            exit 1
+          fi
+
+          if [[ ! -d "${ANANKE_SUBMODULE_PATH}/.git" && ! -f "${ANANKE_SUBMODULE_PATH}/.git" ]]; then
+            echo "::error::Path exists but does not look like a Git submodule: ${ANANKE_SUBMODULE_PATH}"
+            exit 1
+          fi
+
+          echo "Updating Ananke submodule at ${ANANKE_SUBMODULE_PATH} to latest remote branch."
+          git submodule update --remote --recursive "${ANANKE_SUBMODULE_PATH}"
+
+          ananke_commit="$(git -C "${ANANKE_SUBMODULE_PATH}" rev-parse HEAD)"
+          ananke_short_commit="$(git -C "${ANANKE_SUBMODULE_PATH}" rev-parse --short HEAD)"
+          ananke_commit_url="https://github.com/gohugo-ananke/ananke/commit/${ananke_commit}"
+
+          {
+            echo "ananke_commit=${ananke_commit}"
+            echo "ananke_short_commit=${ananke_short_commit}"
+            echo "ananke_commit_url=${ananke_commit_url}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Ananke submodule status:"
+          git -C "${ANANKE_SUBMODULE_PATH}" remote -v
+          git -C "${ANANKE_SUBMODULE_PATH}" branch --show-current || true
+          git -C "${ANANKE_SUBMODULE_PATH}" rev-parse HEAD
+
+      - name: Prepare fresh Hugo cache
+        if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "Preparing fresh Hugo cache."
+          rm -rf "${HUGO_CACHEDIR}" "${GOMODCACHE}"
+          mkdir -p "${HUGO_CACHEDIR}" "${GOMODCACHE}"
 
       - name: Run Hugo build and capture output
         id: build
@@ -117,24 +258,48 @@ jobs:
         shell: bash
         env:
           HUGO_BUILD_COMMAND: ${{ env.HUGO_BUILD_COMMAND }}
+          ANANKE_SUBMODULE_PATH: ${{ env.ANANKE_SUBMODULE_PATH }}
         run: |
           set +e
 
-          mkdir -p .github/.cache/hugo-latest-build-watch
+          mkdir -p .github/.cache/hugo-latest-build-watch-submodule
+
           log_file="${RUNNER_TEMP}/hugo-build-output.log"
+          exit_code_file="${RUNNER_TEMP}/hugo-build-exit-code.txt"
 
           {
             echo "Repository: ${GITHUB_REPOSITORY}"
             echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "Hugo version: ${{ steps.hugo.outputs.version }}"
+            echo "Theme mode: Git submodule"
+            echo "Ananke submodule path: ${ANANKE_SUBMODULE_PATH}"
+            echo "Ananke configured branch: ${{ steps.ananke.outputs.ananke_configured_branch }}"
+            echo "Ananke commit: ${{ steps.ananke.outputs.ananke_commit }}"
             echo "Command: ${HUGO_BUILD_COMMAND}"
             echo
             echo "----- hugo output -----"
-            bash -lc "${HUGO_BUILD_COMMAND}" 2>&1
-            echo "----- end hugo output -----"
-          } | tee "${log_file}"
 
-          exit_code="${PIPESTATUS[0]}"
+            bash -lc "${HUGO_BUILD_COMMAND}"
+            hugo_exit_code="$?"
+
+            echo "${hugo_exit_code}" > "${exit_code_file}"
+
+            echo "----- end hugo output -----"
+          } 2>&1 | tee "${log_file}"
+
+          tee_exit_code="${PIPESTATUS[1]}"
+
+          if [[ "${tee_exit_code}" -ne 0 ]]; then
+            echo "::error::Failed to write Hugo build output log."
+            exit "${tee_exit_code}"
+          fi
+
+          if [[ ! -f "${exit_code_file}" ]]; then
+            echo "::error::Hugo command did not run to completion. No exit code was captured."
+            exit 1
+          fi
+
+          exit_code="$(cat "${exit_code_file}")"
 
           if grep -Eiq '(^|[^[:alpha:]])(error|warning|warn|failed|fatal)([^[:alpha:]]|$)' "${log_file}"; then
             has_problems="true"
@@ -148,22 +313,38 @@ jobs:
             echo "log_file=${log_file}"
           } >> "${GITHUB_OUTPUT}"
 
-          cp "${log_file}" .github/.cache/hugo-latest-build-watch/last-output.log
-          printf '%s\n' "${{ steps.hugo.outputs.version }}" > .github/.cache/hugo-latest-build-watch/version.txt
+          cp "${log_file}" .github/.cache/hugo-latest-build-watch-submodule/last-output.log
+          printf '%s\n' "${{ steps.hugo.outputs.version }}" > .github/.cache/hugo-latest-build-watch-submodule/version.txt
 
-          # Do not fail here. The issue creation step needs to run first.
+          # Non-zero Hugo exits are reportable findings, not workflow failures.
           exit 0
 
-      - name: Create or update failure issue
+      - name: Create or update compatibility issue
         if: steps.build.outputs.has_problems == 'true' || steps.build.outputs.exit_code != '0'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.ANANKE_ISSUE_TOKEN }}
           TARGET_ISSUE_REPOSITORY: ${{ env.TARGET_ISSUE_REPOSITORY }}
           ISSUE_LABELS: ${{ env.ISSUE_LABELS }}
+          ISSUE_ASSIGNEES: ${{ env.ISSUE_ASSIGNEES }}
+
           HUGO_VERSION: ${{ steps.hugo.outputs.version }}
+          HUGO_RELEASE_URL: ${{ steps.hugo.outputs.release_url }}
+
           SOURCE_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
           WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          THEME_MODE: Git submodule
+          ANANKE_SUBMODULE_PATH: ${{ env.ANANKE_SUBMODULE_PATH }}
+          ANANKE_SUBMODULE_NAME: ${{ steps.ananke.outputs.ananke_submodule_name }}
+          ANANKE_CONFIGURED_BRANCH: ${{ steps.ananke.outputs.ananke_configured_branch }}
+          ANANKE_EXPECTED_BRANCH: ${{ env.ANANKE_EXPECTED_BRANCH }}
+          ANANKE_BRANCH_WARNING: ${{ steps.ananke.outputs.ananke_branch_warning }}
+          ANANKE_COMMIT: ${{ steps.ananke.outputs.ananke_commit }}
+          ANANKE_SHORT_COMMIT: ${{ steps.ananke.outputs.ananke_short_commit }}
+          ANANKE_COMMIT_URL: ${{ steps.ananke.outputs.ananke_commit_url }}
+
           EXIT_CODE: ${{ steps.build.outputs.exit_code }}
           LOG_FILE: ${{ steps.build.outputs.log_file }}
         run: |
@@ -174,16 +355,31 @@ jobs:
             exit 1
           fi
 
-          title="failure: build with ${HUGO_VERSION} at ${SOURCE_REPOSITORY}"
+          repo_name="${SOURCE_REPOSITORY##*/}"
+          title="failure: submodule build with ${HUGO_VERSION} at ${repo_name}"
           body_file="${RUNNER_TEMP}/hugo-build-issue.md"
 
           {
-            echo "Hugo build problems were detected in \`${SOURCE_REPOSITORY}\`."
+            echo "Hugo Git submodule build problems were detected in [\`${SOURCE_REPOSITORY}\`](${SOURCE_REPOSITORY_URL})."
             echo
-            echo "- Hugo version: \`${HUGO_VERSION}\`"
-            echo "- Source repository: \`${SOURCE_REPOSITORY}\`"
+            echo "- Hugo version: [\`${HUGO_VERSION}\`](${HUGO_RELEASE_URL})"
+            echo "- Source repository: [\`${SOURCE_REPOSITORY}\`](${SOURCE_REPOSITORY_URL})"
+            echo "- Theme mode: \`${THEME_MODE}\`"
+            echo "- Ananke submodule path: \`${ANANKE_SUBMODULE_PATH}\`"
+            echo "- Ananke submodule name: \`${ANANKE_SUBMODULE_NAME}\`"
+            echo "- Ananke expected branch: \`${ANANKE_EXPECTED_BRANCH}\`"
+            echo "- Ananke configured branch: \`${ANANKE_CONFIGURED_BRANCH:-<unset>}\`"
+            echo "- Ananke commit: [\`${ANANKE_SHORT_COMMIT}\`](${ANANKE_COMMIT_URL})"
             echo "- Exit code: \`${EXIT_CODE}\`"
             echo "- Workflow run: ${WORKFLOW_RUN_URL}"
+
+            if [[ -n "${ANANKE_BRANCH_WARNING}" ]]; then
+              echo
+              echo "## Configuration warning"
+              echo
+              echo "${ANANKE_BRANCH_WARNING}"
+            fi
+
             echo
             echo "## Full CLI output"
             echo
@@ -202,29 +398,67 @@ jobs:
               | head -n 1
           )"
 
+          label_args=()
+
+          if [[ -n "${ISSUE_LABELS}" ]]; then
+            label_args=(--label "${ISSUE_LABELS}")
+          fi
+
+          create_assignee_args=()
+          edit_assignee_args=()
+
+          if [[ -n "${ISSUE_ASSIGNEES}" ]]; then
+            clean_assignees="$(
+              printf '%s' "${ISSUE_ASSIGNEES}" \
+                | tr ',' '\n' \
+                | sed 's/^@//' \
+                | sed 's/^[[:space:]]*//' \
+                | sed 's/[[:space:]]*$//' \
+                | paste -sd ',' -
+            )"
+
+            create_assignee_args=(--assignee "${clean_assignees}")
+            edit_assignee_args=(--add-assignee "${clean_assignees}")
+          fi
+
           if [[ -n "${existing_issue_number}" ]]; then
-            gh issue edit "${existing_issue_number}" \
-              --repo "${TARGET_ISSUE_REPOSITORY}" \
-              --body-file "${body_file}" \
-              --add-label "${ISSUE_LABELS}"
+            edit_args=(
+              issue edit "${existing_issue_number}"
+              --repo "${TARGET_ISSUE_REPOSITORY}"
+              --body-file "${body_file}"
+            )
+
+            if [[ -n "${ISSUE_LABELS}" ]]; then
+              edit_args+=(--add-label "${ISSUE_LABELS}")
+            fi
+
+            if [[ "${#edit_assignee_args[@]}" -gt 0 ]]; then
+              edit_args+=("${edit_assignee_args[@]}")
+            fi
+
+            gh "${edit_args[@]}"
           else
             gh issue create \
               --repo "${TARGET_ISSUE_REPOSITORY}" \
               --title "${title}" \
               --body-file "${body_file}" \
-              --label "${ISSUE_LABELS}"
+              "${label_args[@]}" \
+              "${create_assignee_args[@]}"
           fi
 
-      - name: Mark Hugo version as tested
-        if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
-        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
-        with:
-          path: .github/.cache/hugo-latest-build-watch
-          key: ${{ steps.hugo.outputs.cache_key }}
-
-      - name: Fail workflow when Hugo build had problems
+      - name: Report successful watchdog result
         if: steps.build.outputs.has_problems == 'true' || steps.build.outputs.exit_code != '0'
         shell: bash
         run: |
-          echo "::error::Hugo build produced warnings/errors or failed. Issue was reported to ${{ env.TARGET_ISSUE_REPOSITORY }}."
-          exit 1
+          echo "Hugo Git submodule build problems were detected and reported successfully."
+          echo "Keeping workflow green because reporting is the purpose of this workflow."
+
+      - name: Mark Hugo version as tested
+        if: >-
+          (steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch') &&
+          steps.build.outputs.has_problems != 'true' &&
+          steps.build.outputs.exit_code == '0'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: .github/.cache/hugo-latest-build-watch-submodule
+          key: ${{ steps.hugo.outputs.cache_key }}
