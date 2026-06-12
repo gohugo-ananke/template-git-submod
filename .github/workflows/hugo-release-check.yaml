@@ -1,0 +1,230 @@
+name: Hugo latest build watch
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 03:20 UTC / 10:20 UTC+7.
+    - cron: "20 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hugo-latest-build-watch
+  cancel-in-progress: false
+
+env:
+  TARGET_ISSUE_REPOSITORY: gohugo-ananke/ananke
+  ISSUE_LABELS: status:blocked,prio:critical
+  HUGO_EXTENDED: "false"
+  HUGO_BUILD_COMMAND: hugo --printI18nWarnings --printPathWarnings --printUnusedTemplates
+
+jobs:
+  check-latest-hugo:
+    name: Check latest Hugo build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Detect latest Hugo release
+        id: hugo
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HUGO_EXTENDED: ${{ env.HUGO_EXTENDED }}
+        run: |
+          set -Eeuo pipefail
+
+          latest_json="$(gh api repos/gohugoio/hugo/releases/latest)"
+          version="$(jq -r '.tag_name' <<< "${latest_json}")"
+
+          if [[ -z "${version}" || "${version}" == "null" ]]; then
+            echo "::error::Could not detect latest Hugo release."
+            exit 1
+          fi
+
+          arch="linux-amd64"
+          if [[ "${HUGO_EXTENDED}" == "true" ]]; then
+            asset_pattern="hugo_extended_${version#v}_${arch}.tar.gz"
+          else
+            asset_pattern="hugo_${version#v}_${arch}.tar.gz"
+          fi
+
+          asset_url="$(
+            jq -r --arg asset_pattern "${asset_pattern}" '
+              .assets[]
+              | select(.name == $asset_pattern)
+              | .browser_download_url
+            ' <<< "${latest_json}"
+          )"
+
+          if [[ -z "${asset_url}" || "${asset_url}" == "null" ]]; then
+            echo "::error::Could not find Hugo asset: ${asset_pattern}"
+            exit 1
+          fi
+
+          {
+            echo "version=${version}"
+            echo "asset_url=${asset_url}"
+            echo "cache_key=hugo-build-tested-${version}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Latest Hugo release: ${version}"
+          echo "Asset: ${asset_url}"
+
+      - name: Check whether this Hugo version was already tested
+        id: tested-cache
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: .github/.cache/hugo-latest-build-watch
+          key: ${{ steps.hugo.outputs.cache_key }}
+          lookup-only: true
+
+      - name: Skip unchanged Hugo version
+        if: steps.tested-cache.outputs.cache-hit == 'true' && github.event_name != 'workflow_dispatch'
+        shell: bash
+        run: |
+          echo "Hugo ${{ steps.hugo.outputs.version }} was already tested. Nothing to do."
+
+      - name: Prepare Hugo
+        if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p "${RUNNER_TEMP}/hugo"
+          curl --fail --location --silent --show-error \
+            --output "${RUNNER_TEMP}/hugo/hugo.tar.gz" \
+            "${{ steps.hugo.outputs.asset_url }}"
+
+          tar -xzf "${RUNNER_TEMP}/hugo/hugo.tar.gz" -C "${RUNNER_TEMP}/hugo"
+          chmod +x "${RUNNER_TEMP}/hugo/hugo"
+
+          {
+            echo "${RUNNER_TEMP}/hugo"
+          } >> "${GITHUB_PATH}"
+
+          "${RUNNER_TEMP}/hugo/hugo" version
+
+      - name: Run Hugo build and capture output
+        id: build
+        if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          HUGO_BUILD_COMMAND: ${{ env.HUGO_BUILD_COMMAND }}
+        run: |
+          set +e
+
+          mkdir -p .github/.cache/hugo-latest-build-watch
+          log_file="${RUNNER_TEMP}/hugo-build-output.log"
+
+          {
+            echo "Repository: ${GITHUB_REPOSITORY}"
+            echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Hugo version: ${{ steps.hugo.outputs.version }}"
+            echo "Command: ${HUGO_BUILD_COMMAND}"
+            echo
+            echo "----- hugo output -----"
+            bash -lc "${HUGO_BUILD_COMMAND}" 2>&1
+            echo "----- end hugo output -----"
+          } | tee "${log_file}"
+
+          exit_code="${PIPESTATUS[0]}"
+
+          if grep -Eiq '(^|[^[:alpha:]])(error|warning|warn|failed|fatal)([^[:alpha:]]|$)' "${log_file}"; then
+            has_problems="true"
+          else
+            has_problems="false"
+          fi
+
+          {
+            echo "exit_code=${exit_code}"
+            echo "has_problems=${has_problems}"
+            echo "log_file=${log_file}"
+          } >> "${GITHUB_OUTPUT}"
+
+          cp "${log_file}" .github/.cache/hugo-latest-build-watch/last-output.log
+          printf '%s\n' "${{ steps.hugo.outputs.version }}" > .github/.cache/hugo-latest-build-watch/version.txt
+
+          # Do not fail here. The issue creation step needs to run first.
+          exit 0
+
+      - name: Create or update failure issue
+        if: steps.build.outputs.has_problems == 'true' || steps.build.outputs.exit_code != '0'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.ANANKE_ISSUE_TOKEN }}
+          TARGET_ISSUE_REPOSITORY: ${{ env.TARGET_ISSUE_REPOSITORY }}
+          ISSUE_LABELS: ${{ env.ISSUE_LABELS }}
+          HUGO_VERSION: ${{ steps.hugo.outputs.version }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EXIT_CODE: ${{ steps.build.outputs.exit_code }}
+          LOG_FILE: ${{ steps.build.outputs.log_file }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Missing secret ANANKE_ISSUE_TOKEN. This must be a fine-grained token with issue write access to ${TARGET_ISSUE_REPOSITORY}."
+            exit 1
+          fi
+
+          title="failure: build with ${HUGO_VERSION} at ${SOURCE_REPOSITORY}"
+          body_file="${RUNNER_TEMP}/hugo-build-issue.md"
+
+          {
+            echo "Hugo build problems were detected in \`${SOURCE_REPOSITORY}\`."
+            echo
+            echo "- Hugo version: \`${HUGO_VERSION}\`"
+            echo "- Source repository: \`${SOURCE_REPOSITORY}\`"
+            echo "- Exit code: \`${EXIT_CODE}\`"
+            echo "- Workflow run: ${WORKFLOW_RUN_URL}"
+            echo
+            echo "## Full CLI output"
+            echo
+            echo '```text'
+            cat "${LOG_FILE}"
+            echo '```'
+          } > "${body_file}"
+
+          existing_issue_number="$(
+            gh issue list \
+              --repo "${TARGET_ISSUE_REPOSITORY}" \
+              --state open \
+              --search "${title} in:title" \
+              --json number,title \
+              --jq ".[] | select(.title == \"${title}\") | .number" \
+              | head -n 1
+          )"
+
+          if [[ -n "${existing_issue_number}" ]]; then
+            gh issue edit "${existing_issue_number}" \
+              --repo "${TARGET_ISSUE_REPOSITORY}" \
+              --body-file "${body_file}" \
+              --add-label "${ISSUE_LABELS}"
+          else
+            gh issue create \
+              --repo "${TARGET_ISSUE_REPOSITORY}" \
+              --title "${title}" \
+              --body-file "${body_file}" \
+              --label "${ISSUE_LABELS}"
+          fi
+
+      - name: Mark Hugo version as tested
+        if: steps.tested-cache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        uses: actions/cache/save@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: .github/.cache/hugo-latest-build-watch
+          key: ${{ steps.hugo.outputs.cache_key }}
+
+      - name: Fail workflow when Hugo build had problems
+        if: steps.build.outputs.has_problems == 'true' || steps.build.outputs.exit_code != '0'
+        shell: bash
+        run: |
+          echo "::error::Hugo build produced warnings/errors or failed. Issue was reported to ${{ env.TARGET_ISSUE_REPOSITORY }}."
+          exit 1
