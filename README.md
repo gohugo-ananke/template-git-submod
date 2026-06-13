@@ -2,7 +2,7 @@ Git Submodule based template repository for the [Ananke theme](https://github.co
 
 ## Versions
 
-- [Install Ananke as GoHugo Module](https://github.com/gohugo-ananke/template-hugo-mod)
+- [Install Ananke as Hugo Module](https://github.com/gohugo-ananke/template-hugo-mod)
 - **[Install Ananke as Git Submodule](https://github.com/gohugo-ananke/template-git-submod) - this repository**
 
 ## Requirements
@@ -23,7 +23,7 @@ Or follow the instructions below to install Ananke as a Git submodule in an exis
 
 ## Installation of Ananke as a Git submodule
 
-To install or create a GoHugo website from scratch with the Ananke theme using the submodule method, follow these steps:
+To install or create a Hugo website from scratch with the Ananke theme using the submodule method, follow these steps:
 
 Verify that you have installed Hugo 0.128.0 or later.
 
