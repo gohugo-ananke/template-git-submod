@@ -4,7 +4,7 @@
   "description": "Git Submodule based template repository for the [Ananke theme](https://github.com/gohugo-ananke/ananke) for [GoHugo](https://gohugo.io/).",
   "main": "index.js",
   "scripts": {
-    "update": "git submodule update --remote --merge && git add themes/ananke && git commit -m 'build(deps): update git submodule'",
+    "update": "git submodule update --remote --merge",
     "server": "hugo server --logLevel debug --templateMetrics --templateMetricsHints"
   },
   "repository": {
